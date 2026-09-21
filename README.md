@@ -1,60 +1,48 @@
 # aredl-mcp
 
-An MCP server that gives Claude direct, live access to the [AREDL](https://aredl.net) (All Rated Extreme Demons List) API — no more scraping the website.
+An MCP server that gives Claude access to [AREDL](https://aredl.net) (All Rated Extreme Demons List) data.
+
+## Important: how this actually works
+
+AREDL's real API (`api.aredl.net`) is blocked by Cloudflare bot-protection for any non-browser request — even with a valid personal API key, confirmed by testing directly. So instead, this server scrapes AREDL's public website (`aredl.net`) through [Nimble](https://www.nimbleway.com)'s stealth browser API, which gets past that protection.
+
+Consequences of this approach, to set expectations:
+- You need a **Nimble API key** (free tier: 5,000 requests/month, no card required) — see setup below.
+- Data comes from parsing page text, not a clean JSON API, so a couple of fields (`publisherRaw`, `verifiersRaw`, `creatorsRaw`) come back as one concatenated blob of usernames with no separator — there's no reliable way to split arbitrary usernames apart from plain text. Still readable, just not a clean array.
+- Records and leaderboard tools only return the **first page** (the site loads further pages via client-side JS this scraper doesn't drive).
+- If AREDL redesigns their website, the text-parsing logic here will likely need updating (unlike a real API, which would keep the same shape).
 
 ## What it can do
 
-Read-only tools, no AREDL login needed:
-
-- `search_level` — find a level by (partial) name, get its current rank/id/points
+- `search_level` — find a level by (partial) name, get its current rank + AREDL page id
 - `list_levels_by_rank` — list levels in a rank range (e.g. "find something between rank 100-350")
-- `get_level` — full details for a level by AREDL level id
-- `get_level_history` — a level's rank history over time
-- `get_level_records` — completions/records for a level (who beat it, when, video link)
-- `get_custom_copies` — pre-approved LDMs / bugfixes / Globed 2P copies
-- `get_leaderboard` — player leaderboard (filterable by name/country)
-- `get_player_profile` — a player's profile by AREDL user id
-- `get_bounty_board` — the current bounty board
-- `get_changelog` — recent list changes
+- `get_level` — level details: rank, description, list points, publisher/verifiers/creators (raw), first page of records
+- `get_level_records` — just the records/completions list for a level
+- `get_leaderboard` — top of the player leaderboard (first page, top ~20)
+
+## Setup
+
+1. Get a free Nimble API key at [nimbleway.com](https://www.nimbleway.com) (sign up, no card needed for the free tier).
+2. Set it as an environment variable: `NIMBLE_API_KEY`.
 
 ## Local development
 
 ```bash
 npm install
 npm run build
-npm start
+NIMBLE_API_KEY=your-key-here npm start
 ```
 
-This starts an HTTP server on port 3000 (or `$PORT`) exposing the MCP endpoint at `POST /mcp`, plus a `GET /` health check.
+Starts an HTTP server on port 3000 (or `$PORT`) with the MCP endpoint at `POST /mcp`, a health check at `GET /`, and a one-click check at `GET /debug/nimble-check` that confirms Nimble is actually reaching aredl.net.
 
 ## Deploying on Render
 
-1. Push this folder to a new GitHub repo.
-2. On [Render](https://render.com), click **New > Web Service** and connect that repo.
-3. Settings:
-   - **Build Command:** `npm install && npm run build`
-   - **Start Command:** `npm start`
-   - **Environment:** Node
-4. Deploy. Render gives you a URL like `https://aredl-mcp.onrender.com`.
-5. Your MCP endpoint is `https://aredl-mcp.onrender.com/mcp` — add that as a custom connector in Claude's settings.
+1. Push this folder to a GitHub repo.
+2. On [Render](https://render.com), **New > Web Service**, connect the repo.
+3. Build command: `npm install && npm run build`
+4. Start command: `node dist/server.js`
+5. Add environment variable `NIMBLE_API_KEY` with your key.
+6. Deploy, then visit `https://<your-service>.onrender.com/debug/nimble-check` to confirm it's working.
+7. Add `https://<your-service>.onrender.com/mcp` as a custom connector in Claude's settings.
 
-Note: Render's free tier spins the service down after inactivity, so the first request after a while will be a bit slow (~30s) while it wakes back up. That's normal.
-
-## Important: AREDL's API blocks non-browser requests
-
-`api.aredl.net` has bot protection that returns a 403 to plain (non-browser) HTTP requests, even from a legitimate server like this one. Before this will work at all, you need your own AREDL personal API key:
-
-1. Log into aredl.net (via Discord), then find the "API key" / developer option in your account or profile settings, and generate one. (If you can't find it, ask in AREDL's Discord #support.)
-2. On Render, go to your service → **Environment**, and add an environment variable:
-   - Key: `AREDL_API_KEY`
-   - Value: the key you generated
-3. Redeploy (Render does this automatically when you save an env var change).
-4. Visit `https://<your-service>.onrender.com/debug/auth-check` in a browser. It makes one real request to AREDL and tells you plainly whether the key got past the block:
-   - `"success": true` → it worked, the MCP tools will work too.
-   - `"success": false` → still blocked even with the key. That means the bot protection applies regardless of authentication, and we'd need a different approach (routing through a scraping service like Nimble, which has its own cost).
-
-Never commit your API key to the repo — always set it as an environment variable, not in the code.
-
-## Adding more tools later
-
-Personal/account-based AREDL features (your own records, submissions, notifications, clan actions) also use the same `AREDL_API_KEY`. Add new tools in `src/tools.ts` the same way as the existing ones — they'll automatically pick up the key via `aredlFetch`.
+Render's free tier spins down after inactivity — the first request after a while takes ~30-50s to wake up. Normal, not broken.

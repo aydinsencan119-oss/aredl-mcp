@@ -1,47 +1,185 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { fetchPage } from "./nimble.js";
 
-const API_BASE = "https://api.aredl.net/api/aredl";
+// ---------------------------------------------------------------------
+// AREDL's real API (api.aredl.net) blocks all non-browser requests at the
+// Cloudflare edge, even with a valid personal API key. So instead, these
+// tools scrape the public website (aredl.net) through Nimble's stealth
+// browser driver. This means: best-effort text parsing instead of clean
+// JSON, and only the FIRST PAGE of paginated data (records, leaderboard)
+// since further pages are loaded via client-side JS this scrape doesn't
+// drive. Good enough for lookups; not a full API replacement.
+// ---------------------------------------------------------------------
 
-// Simple in-memory cache for the full level list (it's ~1500 entries and
-// doesn't change often; refetching on every call would be wasteful).
-let levelListCache: { data: any[]; fetchedAt: number } | null = null;
-const LEVEL_LIST_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const LIST_URL = "https://aredl.net/list";
+const LEADERBOARD_URL = "https://aredl.net/leaderboard";
+const levelPageUrl = (id: string) => `https://aredl.net/list/${id}`;
 
-function authHeaders(): Record<string, string> {
-  const key = process.env.AREDL_API_KEY;
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (key) headers.Authorization = `Bearer ${key}`;
-  return headers;
+interface LevelSummary {
+  rank: number;
+  name: string;
+  id: string;
 }
 
-export async function aredlFetch(path: string, params?: Record<string, string | number | boolean | undefined>) {
-  const url = new URL(`${API_BASE}${path}`);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
-      if (v !== undefined) url.searchParams.set(k, String(v));
+let listCache: { data: LevelSummary[]; fetchedAt: number } | null = null;
+const LIST_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function dedupeRepeatedHalf(s: string): string {
+  const n = s.length;
+  if (n > 0 && n % 2 === 0 && s.slice(0, n / 2) === s.slice(n / 2)) {
+    return s.slice(0, n / 2);
+  }
+  return s;
+}
+
+async function getLevelList(): Promise<LevelSummary[]> {
+  if (listCache && Date.now() - listCache.fetchedAt < LIST_TTL_MS) {
+    return listCache.data;
+  }
+  const text = await fetchPage(LIST_URL);
+  const pattern = /\[#(\d+)\s*\n\n(.*?)\]\(https:\/\/aredl\.net\/list\/(\d+)\)/g;
+  const results: LevelSummary[] = [];
+  for (const m of text.matchAll(pattern)) {
+    results.push({ rank: Number(m[1]), name: m[2].trim(), id: m[3] });
+  }
+  if (results.length === 0) {
+    throw new Error("Could not parse the AREDL list page — its layout may have changed.");
+  }
+  listCache = { data: results, fetchedAt: Date.now() };
+  return results;
+}
+
+interface LevelDetail {
+  rank: number | null;
+  name: string;
+  description: string | null;
+  levelId: string | null;
+  listPoints: string | null;
+  publisherRaw: string | null;
+  verifiersRaw: string | null;
+  creatorsRaw: string | null;
+  recordsTotal: number | null;
+  firstPageRecords: { submitter: string; date: string; platform: string }[];
+}
+
+// The scraped page text has no real line breaks or delimiters between UI
+// elements — it's all one run-on string. This boilerplate appears
+// verbatim (the scroll-area accessibility CSS repeats multiple times per
+// page) and gets in the way of finding real content, so strip it first.
+const VIEWPORT_JUNK =
+  "[data-radix-scroll-area-viewport]{scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch;}[data-radix-scroll-area-viewport]::-webkit-scrollbar{display:none}";
+
+function stripBoilerplate(s: string): string {
+  return s
+    .replaceAll(VIEWPORT_JUNK, "")
+    .replace(/:root\{[^}]*\}/g, "")
+    .replace(/DEMON LIST.*?LOGINDiscordLOGIN/gs, "")
+    .replace(/classicplatformer/g, "");
+}
+
+// The site renders the level name twice in a row (main heading + a second
+// element right after it) with nothing between them once boilerplate is
+// stripped — so the name is whatever prefix of the remaining text repeats
+// immediately. This also matches how player names double up on the
+// leaderboard (see dedupeRepeatedHalf), so it's a consistent site quirk,
+// not a one-off hack.
+function findRepeatedPrefixLength(s: string, maxLen = 80): number | null {
+  for (let L = 1; L <= maxLen && L * 2 <= s.length; L++) {
+    if (s.slice(0, L) === s.slice(L, 2 * L)) return L;
+  }
+  return null;
+}
+
+function parseLevelPage(text: string): LevelDetail {
+  const rankMatch = text.match(/#(\d+)\s*-\s*/);
+  let rank: number | null = null;
+  let name = "Unknown";
+  let description: string | null = null;
+
+  if (rankMatch) {
+    rank = Number(rankMatch[1]);
+    let rest = stripBoilerplate(text.slice(rankMatch.index! + rankMatch[0].length));
+    const nameLen = findRepeatedPrefixLength(rest);
+    if (nameLen) {
+      name = rest.slice(0, nameLen);
+      rest = rest.slice(2 * nameLen);
+      // Description runs up to the GD difficulty rating (e.g. "2.1") that
+      // always immediately follows it on the page.
+      const descMatch = rest.match(/^(.*?)\d\.\d/s);
+      if (descMatch) description = descMatch[1].trim() || null;
     }
   }
-  const res = await fetch(url.toString(), { headers: authHeaders() });
-  if (!res.ok) {
-    throw new Error(`AREDL API ${res.status} on ${url.pathname}: ${await res.text()}`);
+
+  const levelIdMatch = text.match(/LEVEL ID\s*(\d+)/);
+  const listPointsMatch = text.match(/list points\s*([\d.]+)/i);
+  const publisherMatch = text.match(/Publisher\s*([^\n]+?)Verifiers/);
+  const verifiersMatch = text.match(/Verifiers\s*([^\n]+?)Creators/);
+  const creatorsMatch = text.match(/Creators\s*([^\n]+?)(?:Position History|Records)/);
+
+  const recordsHeaderMatch = text.match(/Records \((\d+)\)/);
+  const recordsTotal = recordsHeaderMatch ? Number(recordsHeaderMatch[1]) : null;
+
+  const firstPageRecords: { submitter: string; date: string; platform: string }[] = [];
+  if (recordsHeaderMatch) {
+    const body = text.slice(recordsHeaderMatch.index! + recordsHeaderMatch[0].length);
+    const anchor = /(\d{1,2}\/\d{1,2}\/\d{4})(YouTube|Twitch|Medal|Vimeo|BiliBili|Outplayed)/g;
+    let prevEnd = 0;
+    for (const m of body.matchAll(anchor)) {
+      const submitter = body.slice(prevEnd, m.index).trim();
+      if (submitter) {
+        firstPageRecords.push({ submitter, date: m[1], platform: m[2] });
+      }
+      prevEnd = m.index! + m[0].length;
+    }
   }
-  return res.json();
+
+  return {
+    rank,
+    name,
+    description,
+    levelId: levelIdMatch ? levelIdMatch[1] : null,
+    listPoints: listPointsMatch ? listPointsMatch[1] : null,
+    // Publisher/verifiers/creators run together with zero separator between
+    // names (e.g. "CybertronDiamondSkull..."), and there's no reliable way
+    // to split arbitrary usernames apart — mixed case, digits, symbols all
+    // appear inside real names. Rather than guess and mangle them, these
+    // come back as the raw blob; still useful to read, just not an array.
+    publisherRaw: publisherMatch ? publisherMatch[1].trim() : null,
+    verifiersRaw: verifiersMatch ? verifiersMatch[1].trim() : null,
+    creatorsRaw: creatorsMatch ? creatorsMatch[1].trim() : null,
+    recordsTotal,
+    firstPageRecords,
+  };
 }
 
-async function getLevelList(): Promise<any[]> {
-  if (levelListCache && Date.now() - levelListCache.fetchedAt < LEVEL_LIST_TTL_MS) {
-    return levelListCache.data;
+interface LeaderboardEntry {
+  rank: number;
+  player: string;
+  points: string;
+  hardest: string;
+  extremesCount: number;
+}
+
+function parseLeaderboard(text: string): LeaderboardEntry[] {
+  const pattern = /#(\d+)(.*?)([\d,.]+)\s*pts[\d,.]+\s*points(.*?)(\d+)\s*extremes/g;
+  const results: LeaderboardEntry[] = [];
+  for (const m of text.matchAll(pattern)) {
+    results.push({
+      rank: Number(m[1]),
+      player: dedupeRepeatedHalf(m[2].trim()),
+      points: m[3],
+      hardest: m[4].trim(),
+      extremesCount: Number(m[5]),
+    });
   }
-  const data = (await aredlFetch("/levels")) as any[];
-  levelListCache = { data, fetchedAt: Date.now() };
-  return data;
+  return results;
 }
 
 export function createServer() {
   const server = new McpServer({
     name: "aredl",
-    version: "1.0.0",
+    version: "2.0.0",
   });
 
   server.registerTool(
@@ -49,7 +187,7 @@ export function createServer() {
     {
       title: "Search AREDL level by name",
       description:
-        "Find a level on the All Rated Extreme Demons List by (partial, case-insensitive) name. Returns matching levels with their current rank, id, and points.",
+        "Find a level on the All Rated Extreme Demons List by (partial, case-insensitive) name. Returns matching levels with current rank and AREDL page id. Rank 1 is the hardest.",
       inputSchema: {
         query: z.string().describe("Level name or partial name to search for"),
         limit: z.number().int().min(1).max(25).default(10),
@@ -58,13 +196,8 @@ export function createServer() {
     async ({ query, limit }) => {
       const levels = await getLevelList();
       const q = query.toLowerCase();
-      const matches = levels
-        .filter((l) => (l.name ?? "").toLowerCase().includes(q))
-        .slice(0, limit)
-        .map((l) => ({ id: l.id, name: l.name, rank: l.position, points: l.points }));
-      return {
-        content: [{ type: "text", text: JSON.stringify(matches, null, 2) }],
-      };
+      const matches = levels.filter((l) => l.name.toLowerCase().includes(q)).slice(0, limit);
+      return { content: [{ type: "text", text: JSON.stringify(matches, null, 2) }] };
     }
   );
 
@@ -73,7 +206,7 @@ export function createServer() {
     {
       title: "List AREDL levels in a rank range",
       description:
-        "Get levels ranked between min_rank and max_rank (inclusive) on the AREDL. Rank 1 is the hardest. Useful for finding a level of similar or greater difficulty than another.",
+        "Get levels ranked between min_rank and max_rank (inclusive). Rank 1 is the hardest. Useful for finding a level of similar or greater difficulty than another.",
       inputSchema: {
         min_rank: z.number().int().min(1),
         max_rank: z.number().int().min(1),
@@ -83,13 +216,8 @@ export function createServer() {
       const levels = await getLevelList();
       const lo = Math.min(min_rank, max_rank);
       const hi = Math.max(min_rank, max_rank);
-      const results = levels
-        .filter((l) => l.position >= lo && l.position <= hi)
-        .sort((a, b) => a.position - b.position)
-        .map((l) => ({ id: l.id, name: l.name, rank: l.position, points: l.points }));
-      return {
-        content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-      };
+      const results = levels.filter((l) => l.rank >= lo && l.rank <= hi).sort((a, b) => a.rank - b.rank);
+      return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
     }
   );
 
@@ -97,130 +225,55 @@ export function createServer() {
     "get_level",
     {
       title: "Get AREDL level details",
-      description: "Get full details for a specific level by its AREDL level id (not the GD level id).",
-      inputSchema: { level_id: z.string() },
+      description:
+        "Get details for a level by its AREDL page id (from search_level/list_levels_by_rank): rank, description, list points, and the most recent page of completion records. publisherRaw/verifiersRaw/creatorsRaw are usernames concatenated with no separator (a scraping limitation) — still readable, just not a clean array.",
+      inputSchema: { level_id: z.string().describe("The AREDL page id, e.g. '71216292'") },
     },
     async ({ level_id }) => {
-      const data = await aredlFetch(`/levels/${level_id}`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.registerTool(
-    "get_level_history",
-    {
-      title: "Get AREDL level rank history",
-      description: "Get the historical rank changes for a level over time.",
-      inputSchema: { level_id: z.string() },
-    },
-    async ({ level_id }) => {
-      const data = await aredlFetch(`/levels/${level_id}/history`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      const text = await fetchPage(levelPageUrl(level_id));
+      const detail = parseLevelPage(text);
+      return { content: [{ type: "text", text: JSON.stringify(detail, null, 2) }] };
     }
   );
 
   server.registerTool(
     "get_level_records",
     {
-      title: "Get AREDL level completions",
-      description: "Get accepted completion records for a level: who beat it, when, and their video link.",
-      inputSchema: {
-        level_id: z.string(),
-        submitter_filter: z.string().optional().describe("Filter by submitter name"),
-        page: z.number().int().min(1).default(1),
-        per_page: z.number().int().min(1).max(100).default(25),
-      },
-    },
-    async ({ level_id, submitter_filter, page, per_page }) => {
-      const data = await aredlFetch(`/levels/${level_id}/records`, {
-        submitter_filter,
-        page,
-        per_page,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.registerTool(
-    "get_custom_copies",
-    {
-      title: "Get AREDL pre-approved custom copies",
+      title: "Get AREDL level completions (first page)",
       description:
-        "Get pre-approved custom copies (LDMs, bugfixes, Globed 2P copies) for a level. Pass level_id to filter to one level; omit to browse all.",
-      inputSchema: {
-        level_id: z.string().optional(),
-        description: z.string().optional().describe("Free-text filter on the copy's description"),
-      },
+        "Get the most recent page of completion records for a level (submitter, date, video platform). Only the first page is available (roughly the oldest ~50 records as AREDL orders them) — this is a scraping limitation, not a filter.",
+      inputSchema: { level_id: z.string() },
     },
-    async ({ level_id, description }) => {
-      const data = (await aredlFetch("/levels/custom-copies", { description })) as any[];
-      const filtered = level_id ? data.filter((c) => c.level_id === level_id) : data;
-      return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
+    async ({ level_id }) => {
+      const text = await fetchPage(levelPageUrl(level_id));
+      const detail = parseLevelPage(text);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { recordsTotal: detail.recordsTotal, records: detail.firstPageRecords },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
   );
 
   server.registerTool(
     "get_leaderboard",
     {
-      title: "Get AREDL player leaderboard",
-      description: "Get the player leaderboard ranked by list points. Can filter by player name or country.",
-      inputSchema: {
-        page: z.number().int().min(1).default(1),
-        per_page: z.number().int().min(1).max(100).default(25),
-        name_filter: z.string().optional(),
-        country_filter: z.number().int().optional(),
-      },
-    },
-    async ({ page, per_page, name_filter, country_filter }) => {
-      const data = await aredlFetch("/leaderboard", {
-        page,
-        per_page,
-        name_filter,
-        country_filter,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.registerTool(
-    "get_player_profile",
-    {
-      title: "Get AREDL player profile",
-      description: "Get a player's AREDL profile (levels beaten, points, rank) by their AREDL user id.",
-      inputSchema: { id: z.string() },
-    },
-    async ({ id }) => {
-      const data = await aredlFetch(`/profile/${id}`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.registerTool(
-    "get_bounty_board",
-    {
-      title: "Get AREDL bounty board",
-      description: "Get the current AREDL bounty board (community challenges/bounties).",
+      title: "Get AREDL player leaderboard (first page)",
+      description:
+        "Get the top of the AREDL player leaderboard, ranked by list points. Only the first page (top 20) is available — a scraping limitation, not a filter.",
       inputSchema: {},
     },
     async () => {
-      const data = await aredlFetch("/bounty-board");
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.registerTool(
-    "get_changelog",
-    {
-      title: "Get AREDL changelog",
-      description: "Get recent list changes (levels added, moved, or removed).",
-      inputSchema: {
-        page: z.number().int().min(1).default(1),
-        per_page: z.number().int().min(1).max(100).default(25),
-      },
-    },
-    async ({ page, per_page }) => {
-      const data = await aredlFetch("/changelog", { page, per_page });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      const text = await fetchPage(LEADERBOARD_URL);
+      const entries = parseLeaderboard(text);
+      return { content: [{ type: "text", text: JSON.stringify(entries, null, 2) }] };
     }
   );
 

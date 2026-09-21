@@ -1,6 +1,7 @@
 import express from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createServer, aredlFetch } from "./tools.js";
+import { createServer } from "./tools.js";
+import { fetchPage } from "./nimble.js";
 
 const app = express();
 app.use(express.json());
@@ -10,27 +11,25 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, name: "aredl-mcp", message: "AREDL MCP server is running." });
 });
 
-// Visit this in a browser after setting AREDL_API_KEY to check whether
-// AREDL's bot protection is letting authenticated requests through.
-app.get("/debug/auth-check", async (_req, res) => {
-  const hasKey = Boolean(process.env.AREDL_API_KEY);
+// Visit this in a browser after setting NIMBLE_API_KEY to check whether
+// Nimble is successfully scraping aredl.net for this server.
+app.get("/debug/nimble-check", async (_req, res) => {
+  const hasKey = Boolean(process.env.NIMBLE_API_KEY);
   try {
-    const data = (await aredlFetch("/leaderboard", { per_page: 1 })) as any;
+    const text = await fetchPage("https://aredl.net/leaderboard");
     res.json({
       hasKey,
       success: true,
-      message: hasKey
-        ? "It worked! Your API key is getting past AREDL's bot protection."
-        : "It worked, but no AREDL_API_KEY is set — AREDL may just be allowing this request anyway.",
-      sample: data,
+      message: "It worked! Nimble is fetching aredl.net successfully.",
+      sample: text.slice(0, 400),
     });
   } catch (err: any) {
     res.status(200).json({
       hasKey,
       success: false,
       message: hasKey
-        ? "Still blocked even with the API key set. The bot protection likely applies regardless of auth."
-        : "Blocked, as expected without an API key set. Set AREDL_API_KEY and try again.",
+        ? "Nimble is configured but the fetch still failed — see error below."
+        : "NIMBLE_API_KEY isn't set yet. Set it and try again.",
       error: String(err?.message ?? err),
     });
   }
